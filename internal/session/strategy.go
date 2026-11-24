@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/authelia/authelia/v4/internal/clock"
@@ -54,6 +55,34 @@ type DefaultStrategy struct {
 
 	codec      Codec
 	repository Repository
+
+	ringCoordinator *RingCoordinator
+
+	resealSuccesses       atomic.Uint64
+	resealFailures        atomic.Uint64
+	consecutiveResealFail atomic.Uint64
+	cleanupSuccesses      atomic.Uint64
+	cleanupFailures       atomic.Uint64
+}
+
+// RepairMetrics contains observable counts for transparent key-generation repair operations.
+type RepairMetrics struct {
+	ResealSuccesses        uint64
+	ResealFailures         uint64
+	ConsecutiveResealFails uint64
+	CleanupSuccesses       uint64
+	CleanupFailures        uint64
+}
+
+// RepairMetrics returns cumulative repair counts for this strategy.
+func (p *DefaultStrategy) RepairMetrics() RepairMetrics {
+	return RepairMetrics{
+		ResealSuccesses:        p.resealSuccesses.Load(),
+		ResealFailures:         p.resealFailures.Load(),
+		ConsecutiveResealFails: p.consecutiveResealFail.Load(),
+		CleanupSuccesses:       p.cleanupSuccesses.Load(),
+		CleanupFailures:        p.cleanupFailures.Load(),
+	}
 }
 
 // GetConfig returns the session cookie configuration of this strategy.
@@ -265,6 +294,12 @@ func (p *DefaultStrategy) get(ctx Context) (id string, session *UserSession, err
 
 	id = p.codec.Sign(cookie)
 
+	if p.ringCoordinator != nil {
+		// Propagation is best effort and throttled. A synchronization failure must not turn an otherwise readable local
+		// generation into a different class of error; the authoritative record read below classifies backend failure.
+		_, _ = p.ringCoordinator.SyncIfDue(ctx)
+	}
+
 	if cached, ok := p.getCached(ctx); ok {
 		return id, cached, nil
 	}
@@ -272,7 +307,9 @@ func (p *DefaultStrategy) get(ctx Context) (id string, session *UserSession, err
 	var record Record
 
 	if record, err = p.repository.Get(ctx, p.issuer, id); err != nil {
-		return id, nil, fmt.Errorf("%w: %w", ErrRepositoryGet, err)
+		wrapped := fmt.Errorf("%w: %w", ErrRepositoryGet, err)
+
+		return id, nil, &ReadError{Reason: ReadReasonBackendUnavailable, Err: wrapped}
 	}
 
 	if record == nil || len(record.GetSessionData()) == 0 {
@@ -282,22 +319,130 @@ func (p *DefaultStrategy) get(ctx Context) (id string, session *UserSession, err
 	}
 
 	if record.GetSessionSignature() != id {
-		return id, nil, errors.New("error occurred getting session: signature does not match the session identifier")
+		err = &ReadError{Reason: ReadReasonSignatureMismatch, Err: errors.New("error occurred getting session: signature does not match the session identifier")}
+
+		_ = p.purgeUnreadable(ctx, id, "", "")
+		p.setCached(ctx, &userSession)
+
+		return id, nil, err
 	}
 
 	session = &UserSession{}
 
-	if err = p.codec.Open(p.config.Domain, record, session); err != nil {
-		return id, nil, fmt.Errorf("error occurred decoding session: %w", err)
+	generation, openErr := p.openRecord(p.config.Domain, record, session)
+	if openErr != nil {
+		err = fmt.Errorf("error occurred decoding session: %w", openErr)
+
+		// A missing key generation may become available after configuration/state propagation, so retain the backend
+		// record. Cache the anonymous fallback for this request so repeated consumers do not log the same identifier
+		// failure more than once. Retired/unopenable records are additionally purged and their cookie is cleared.
+		if !errors.Is(openErr, ErrKeyGenerationUnavailable) {
+			_ = p.purgeUnreadable(ctx, id, "", "")
+		}
+
+		p.setCached(ctx, &userSession)
+
+		return id, nil, err
 	}
 
 	if session.CookieDomain != p.config.Domain {
-		return id, nil, errors.New("error occurred getting session: domain does not match cookie domain")
+		err = &ReadError{Reason: ReadReasonDomainMismatch, Generation: generation, Err: errors.New("error occurred getting session: domain does not match cookie domain")}
+
+		_ = p.purgeUnreadable(ctx, id, session.PublicID, session.Username)
+		p.setCached(ctx, &userSession)
+
+		return id, nil, err
 	}
+
+	p.maybeReseal(ctx, id, generation, session)
 
 	p.setCached(ctx, session)
 
 	return id, session, nil
+}
+
+type generationCodec interface {
+	OpenGeneration(domain string, record Record, session *UserSession) (generation string, err error)
+	PrimaryGeneration() string
+}
+
+type generationSealer interface {
+	SealGeneration(domain, id string, session UserSession) (generation string, data []byte, err error)
+}
+
+func (p *DefaultStrategy) openRecord(domain string, record Record, session *UserSession) (generation string, err error) {
+	if gc, ok := p.codec.(generationCodec); ok {
+		return gc.OpenGeneration(domain, record, session)
+	}
+
+	return "", p.codec.Open(domain, record, session)
+}
+
+func (p *DefaultStrategy) primaryGeneration() string {
+	if gc, ok := p.codec.(generationCodec); ok {
+		return gc.PrimaryGeneration()
+	}
+
+	return ""
+}
+
+// maybeReseal transparently rewrites a record sealed by a readable non-primary generation. The returned read always
+// uses the successfully opened session even when this best-effort repair fails. Repository atomicity ensures a lost race
+// with Destroy or ChangeID cannot resurrect a moved/destroyed identifier.
+func (p *DefaultStrategy) maybeReseal(ctx Context, id, generation string, session *UserSession) {
+	primary := p.primaryGeneration()
+
+	if generation == primary {
+		return
+	}
+
+	var (
+		data []byte
+		err  error
+	)
+
+	if gs, ok := p.codec.(generationSealer); ok {
+		_, data, err = gs.SealGeneration(p.config.Domain, id, *session)
+	} else {
+		data, err = p.codec.Seal(p.config.Domain, id, *session)
+	}
+
+	if err != nil {
+		p.noteResealFailure()
+
+		return
+	}
+
+	expiration := p.getExpiration(*session)
+
+	if err = p.repository.SaveData(ctx, p.issuer, id, session.PublicID, session.Username, expiration, data); err != nil {
+		p.noteResealFailure()
+
+		return
+	}
+
+	p.resealSuccesses.Add(1)
+	p.consecutiveResealFail.Store(0)
+}
+
+func (p *DefaultStrategy) noteResealFailure() {
+	p.resealFailures.Add(1)
+	p.consecutiveResealFail.Add(1)
+}
+
+// purgeUnreadable removes a record which must be treated as absent and expires the browser cookie. Backend deletion
+// errors are counted but deliberately do not expose backend or cryptographic detail to callers.
+func (p *DefaultStrategy) purgeUnreadable(ctx Context, id, pid, username string) (err error) {
+	if err = p.repository.Delete(ctx, p.issuer, id, pid, username); err != nil {
+		p.cleanupFailures.Add(1)
+
+		return err
+	}
+
+	p.cleanupSuccesses.Add(1)
+	ctx.ClearCookie(p.newDeletionCookie())
+
+	return nil
 }
 
 func (p *DefaultStrategy) getCached(ctx Context) (session *UserSession, ok bool) {

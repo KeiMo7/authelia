@@ -897,6 +897,20 @@ session:
   ## Secret can also be set using a secret: https://www.authelia.com/c/secrets
   secret: 'insecure_session_secret'
 
+  ## Optional multi-generation session encryption keys. Records store the non-secret generation id in the backend only;
+  ## exactly one generation must be primary. Non-primary generations remain readable during rotation, and retired
+  ## generations are treated as absent and cleaned up. When this is omitted, only 'secret' is used.
+  # primary_key_id: '2026-q4'
+  # encryption_keys:
+  #   - id: '2026-q4'
+  #     secret: 'replace-with-a-long-random-secret'
+  #     primary: true
+  #   - id: '2026-q3'
+  #     secret: 'previous-long-random-secret'
+  #   - id: '2026-q2'
+  #     secret: 'retired-long-random-secret'
+  #     retired: true
+
   ## The storage backend sessions are persisted to, either 'internal' (the configured storage provider) or 'cache'
   ## (the configured cache provider).
   # storage: 'internal'

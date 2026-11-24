@@ -109,6 +109,14 @@ func (s *CookieSessionAuthnStrategy) Get(ctx AuthzContext, manager session.Manag
 	}
 
 	if userSession, err = manager.GetSession(); err != nil {
+		// A backend read outage must degrade to an anonymous authorization decision rather than become a server error.
+		// The record is intentionally retained; only explicit absence/retirement/open failure may clean it up.
+		if errors.Is(err, session.ErrRepositoryGet) {
+			ctx.GetLogger().WithField("reason", session.ReadReasonBackendUnavailable).Warn("Session backend could not be read; treating request as unauthenticated")
+
+			return authn, nil
+		}
+
 		return authn, fmt.Errorf("failed to retrieve user session: %w", err)
 	}
 

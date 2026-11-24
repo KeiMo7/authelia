@@ -240,10 +240,21 @@ func (authz *Authz) handleAuthnError(ctx AuthzContext, authn *Authn, strategy Au
 
 	bypass := !ruleHasSubject && required == authorization.Bypass
 
+	logger := ctx.GetLogger()
+	if reason := session.ReasonForError(err); reason != "" {
+		logger = logger.WithField("reason", reason)
+	}
+
+	if generation := session.GenerationForError(err); generation != "" {
+		logger = logger.WithField("key_generation", generation)
+	}
+
+	safeErr := session.SafeError(err)
+
 	if bypass {
-		ctx.GetLogger().WithError(err).Debug("The matched rule was a bypass rule however an error occurred processing the authorization request")
+		logger.WithError(safeErr).Debug("The matched rule was a bypass rule however an error occurred processing the authorization request")
 	} else {
-		ctx.GetLogger().WithError(err).Error("Error occurred while attempting to authenticate a request")
+		logger.WithError(safeErr).Error("Error occurred while attempting to authenticate a request")
 	}
 
 	if ruleHasSubject || bypass {

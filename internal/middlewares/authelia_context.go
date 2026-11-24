@@ -417,7 +417,15 @@ func (ctx *AutheliaCtx) GetSession() (userSession session.UserSession, err error
 			return userSession, err
 		}
 
-		ctx.Logger.WithError(err).Error("Unable to retrieve user session")
+		fields := map[string]any{"reason": session.ReasonForError(err)}
+
+		if generation := session.GenerationForError(err); generation != "" {
+			fields["key_generation"] = generation
+		}
+
+		// Never attach the raw error for an unopenable record: it may contain the cryptographic provider's explanation.
+		// The classified reason/generation and a stable sentinel are the safe observability contract.
+		ctx.Logger.WithFields(fields).WithError(session.SafeError(err)).Error("Unable to retrieve user session")
 
 		return provider.NewDefault(), nil
 	}

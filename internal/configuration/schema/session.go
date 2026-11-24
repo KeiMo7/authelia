@@ -15,6 +15,25 @@ type Session struct {
 
 	Secret string `koanf:"secret" yaml:"secret,omitempty" toml:"secret,omitempty" json:"secret,omitempty" jsonschema:"title=Secret" jsonschema_description:"Secret used to encrypt the session data."`
 
+	// PrimaryKeyID selects the primary generation in EncryptionKeys. When empty, exactly one generation may set Primary.
+	PrimaryKeyID string `koanf:"primary_key_id" yaml:"primary_key_id,omitempty" toml:"primary_key_id,omitempty" json:"primary_key_id,omitempty"`
+
+	// Encryption configures a nested key ring. It is merged with EncryptionKeys during validation.
+	Encryption *SessionKeyRing `koanf:"encryption" yaml:"encryption,omitempty" toml:"encryption,omitempty" json:"encryption,omitempty"`
+
+	// KeyRing is an alias for Encryption.
+	KeyRing *SessionKeyRing `koanf:"key_ring" yaml:"key_ring,omitempty" toml:"key_ring,omitempty" json:"key_ring,omitempty"`
+
+	// EncryptionKeys configures multiple session encryption key generations. The primary generation writes new records;
+	// other non-retired generations remain readable during rotation windows.
+	EncryptionKeys []SessionEncryptionKey `koanf:"encryption_keys" yaml:"encryption_keys,omitempty" toml:"encryption_keys,omitempty" json:"encryption_keys,omitempty"`
+
+	// KeyGenerations is an alias for EncryptionKeys for configuration surfaces which use generation terminology.
+	KeyGenerations []SessionEncryptionKey `koanf:"key_generations" yaml:"key_generations,omitempty" toml:"key_generations,omitempty" json:"key_generations,omitempty"`
+
+	// Keys is a short alias for EncryptionKeys.
+	Keys []SessionEncryptionKey `koanf:"keys" yaml:"keys,omitempty" toml:"keys,omitempty" json:"keys,omitempty"`
+
 	Storage string `koanf:"storage" yaml:"storage,omitempty" toml:"storage,omitempty" json:"storage,omitempty" jsonschema:"default=internal,title=Storage,enum=internal,enum=cache" jsonschema_description:"The storage provider to use for session storage."`
 
 	Cookies []SessionCookie `koanf:"cookies" yaml:"cookies,omitempty" toml:"cookies,omitempty" json:"cookies,omitempty" jsonschema:"title=Cookies" jsonschema_description:"List of cookie domain configurations."`
@@ -22,6 +41,98 @@ type Session struct {
 	// Deprecated: Use the session cookies option with the same name instead.
 	Domain string `koanf:"domain" yaml:"domain,omitempty" toml:"domain,omitempty" json:"domain,omitempty" jsonschema:"deprecated,title=Domain"`
 }
+
+// SessionEncryptionKey configures one generation of session encryption key material.
+type SessionEncryptionKey struct {
+	// ID is the non-secret generation identifier written to the backend record envelope.
+	ID string `koanf:"id" yaml:"id,omitempty" toml:"id,omitempty" json:"id,omitempty"`
+
+	// KeyID is an alias for ID.
+	KeyID string `koanf:"key_id" yaml:"key_id,omitempty" toml:"key_id,omitempty" json:"key_id,omitempty"`
+
+	// Generation is an alias for ID.
+	Generation string `koanf:"generation" yaml:"generation,omitempty" toml:"generation,omitempty" json:"generation,omitempty"`
+
+	// Secret is the raw key material for this generation.
+	Secret string `koanf:"secret" yaml:"secret,omitempty" toml:"secret,omitempty" json:"secret,omitempty"`
+
+	// Key is an alias for Secret.
+	Key string `koanf:"key" yaml:"key,omitempty" toml:"key,omitempty" json:"key,omitempty"`
+
+	// Primary marks the generation used for new seals.
+	Primary bool `koanf:"primary" yaml:"primary,omitempty" toml:"primary,omitempty" json:"primary,omitempty"`
+
+	// Active is an alias for Primary.
+	Active bool `koanf:"active" yaml:"active,omitempty" toml:"active,omitempty" json:"active,omitempty"`
+
+	// Retired denies reads for records of this generation and causes them to be cleaned up as absent.
+	Retired bool `koanf:"retired" yaml:"retired,omitempty" toml:"retired,omitempty" json:"retired,omitempty"`
+
+	// Disabled is an alias for Retired.
+	Disabled bool `koanf:"disabled" yaml:"disabled,omitempty" toml:"disabled,omitempty" json:"disabled,omitempty"`
+
+	// State accepts primary, read_only, or retired and normalizes the boolean lifecycle fields.
+	State string `koanf:"state" yaml:"state,omitempty" toml:"state,omitempty" json:"state,omitempty"`
+}
+
+// Normalize fills field aliases and lifecycle booleans from their canonical alternatives.
+func (k *SessionEncryptionKey) Normalize() {
+	if k.ID == "" {
+		for _, candidate := range []string{k.KeyID, k.Generation} {
+			if candidate != "" {
+				k.ID = candidate
+				break
+			}
+		}
+	}
+
+	if k.Secret == "" && k.Key != "" {
+		k.Secret = k.Key
+	}
+
+	if !k.Primary && k.Active {
+		k.Primary = true
+	}
+
+	if !k.Retired && k.Disabled {
+		k.Retired = true
+	}
+
+	switch k.State {
+	case "primary", "active":
+		k.Primary = true
+		k.Retired = false
+	case "retired", "disabled":
+		k.Retired = true
+		k.Primary = false
+	case "read_only", "readonly", "readable":
+		if !k.Primary {
+			k.Retired = false
+		}
+	}
+}
+
+// SessionKeyRing configures a primary key generation and its readable/retired generations.
+type SessionKeyRing struct {
+	// PrimaryKeyID selects the generation used for new seals.
+	PrimaryKeyID string `koanf:"primary_key_id" yaml:"primary_key_id,omitempty" toml:"primary_key_id,omitempty" json:"primary_key_id,omitempty"`
+
+	// Primary is an alias for PrimaryKeyID.
+	Primary string `koanf:"primary" yaml:"primary,omitempty" toml:"primary,omitempty" json:"primary,omitempty"`
+
+	// Keys is the generation set.
+	Keys []SessionEncryptionKey `koanf:"keys" yaml:"keys,omitempty" toml:"keys,omitempty" json:"keys,omitempty"`
+
+	// Generations is an alias for Keys.
+	Generations []SessionEncryptionKey `koanf:"generations" yaml:"generations,omitempty" toml:"generations,omitempty" json:"generations,omitempty"`
+}
+
+// Compatibility aliases for configuration surfaces which call a generation a key or key generation.
+type (
+	SessionKey        = SessionEncryptionKey
+	SessionGeneration = SessionEncryptionKey
+	SessionKeyConfig  = SessionEncryptionKey
+)
 
 // SessionCookieCommon represents the session cookie configuration options shared by every session cookie domain.
 type SessionCookieCommon struct {

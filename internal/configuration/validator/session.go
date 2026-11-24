@@ -24,6 +24,7 @@ func ValidateSession(config *schema.Configuration, validator *schema.StructValid
 }
 
 func validateSession(config *schema.Configuration, validator *schema.StructValidator) {
+	validateSessionKeyGenerations(config, validator)
 	validateSessionStorage(config, validator)
 
 	if config.Session.Expiration <= 0 {
@@ -82,6 +83,124 @@ func validateSession(config *schema.Configuration, validator *schema.StructValid
 	}
 
 	validateSessionCookieDomains(&config.Session, validator)
+}
+
+func validateSessionKeyGenerations(config *schema.Configuration, validator *schema.StructValidator) {
+	// Merge the supported public aliases into the canonical EncryptionKeys field. Normal configuration decoding uses
+	// only one spelling; the fallbacks keep programmatic/test configuration ergonomic.
+	if ring := config.Session.Encryption; ring != nil {
+		if config.Session.PrimaryKeyID == "" {
+			config.Session.PrimaryKeyID = firstNonEmptySessionValue(ring.PrimaryKeyID, ring.Primary)
+		}
+
+		config.Session.EncryptionKeys = append(config.Session.EncryptionKeys, ring.Keys...)
+		config.Session.EncryptionKeys = append(config.Session.EncryptionKeys, ring.Generations...)
+	}
+
+	if ring := config.Session.KeyRing; ring != nil {
+		if config.Session.PrimaryKeyID == "" {
+			config.Session.PrimaryKeyID = firstNonEmptySessionValue(ring.PrimaryKeyID, ring.Primary)
+		}
+
+		config.Session.EncryptionKeys = append(config.Session.EncryptionKeys, ring.Keys...)
+		config.Session.EncryptionKeys = append(config.Session.EncryptionKeys, ring.Generations...)
+	}
+
+	if len(config.Session.EncryptionKeys) == 0 && len(config.Session.KeyGenerations) != 0 {
+		config.Session.EncryptionKeys = config.Session.KeyGenerations
+	}
+
+	if len(config.Session.EncryptionKeys) == 0 && len(config.Session.Keys) != 0 {
+		config.Session.EncryptionKeys = config.Session.Keys
+	}
+
+	for i := range config.Session.EncryptionKeys {
+		config.Session.EncryptionKeys[i].Normalize()
+	}
+
+	keys := config.Session.EncryptionKeys
+	primaryID := config.Session.PrimaryKeyID
+
+	if primaryID == "" && len(keys) == 0 {
+		return
+	}
+
+	if len(keys) == 0 {
+		validator.Push(fmt.Errorf(errFmtSessionKeyGenerationsEmpty, "encryption_keys"))
+
+		return
+	}
+
+	ids := make(map[string]struct{}, len(keys))
+	primaryIndexes := make([]int, 0, 1)
+
+	for i, key := range keys {
+		if key.ID == "" {
+			validator.Push(fmt.Errorf(errFmtSessionKeyIDRequired, i))
+		} else {
+			if _, exists := ids[key.ID]; exists {
+				validator.Push(fmt.Errorf(errFmtSessionKeyIDDuplicate, key.ID, i))
+			}
+
+			ids[key.ID] = struct{}{}
+		}
+
+		if key.Secret == "" {
+			validator.Push(fmt.Errorf(errFmtSessionKeySecretRequired, i))
+		}
+
+		if key.Primary {
+			primaryIndexes = append(primaryIndexes, i)
+		}
+
+		if key.Primary && key.Retired {
+			validator.Push(fmt.Errorf(errFmtSessionKeyPrimaryRetired, key.ID))
+		}
+	}
+
+	if primaryID != "" {
+		if _, ok := ids[primaryID]; !ok {
+			validator.Push(fmt.Errorf(errFmtSessionKeyPrimaryMissing))
+		}
+
+		for _, key := range keys {
+			if key.ID == primaryID && key.Retired {
+				validator.Push(fmt.Errorf(errFmtSessionKeyPrimaryRetired, primaryID))
+			}
+		}
+	}
+
+	primaryFlagID := ""
+	if len(primaryIndexes) == 1 {
+		primaryFlagID = keys[primaryIndexes[0]].ID
+	}
+
+	switch {
+	case len(primaryIndexes) > 1:
+		validator.Push(errors.New(errFmtSessionKeyPrimaryDuplicate))
+	case primaryID != "" && primaryFlagID != "" && primaryID != primaryFlagID:
+		validator.Push(errors.New(errFmtSessionKeyPrimaryDuplicate))
+	case primaryID == "" && len(primaryIndexes) == 1:
+		primaryID = primaryFlagID
+		config.Session.PrimaryKeyID = primaryID
+	case primaryID == "" && len(primaryIndexes) == 0:
+		validator.Push(fmt.Errorf(errFmtSessionKeyPrimaryMissing))
+	}
+
+	if primaryID != "" {
+		var primary *schema.SessionEncryptionKey
+
+		for i := range keys {
+			if keys[i].ID == primaryID {
+				primary = &keys[i]
+				break
+			}
+		}
+
+		if config.Session.Secret == "" && primary != nil && !primary.Retired {
+			config.Session.Secret = primary.Secret
+		}
+	}
 }
 
 func validateSessionStorage(config *schema.Configuration, validator *schema.StructValidator) {
@@ -288,4 +407,14 @@ func validateSessionSameSite(i int, config *schema.Session, validator *schema.St
 
 func sessionDomainDescriptor(position int, domain schema.SessionCookie) string {
 	return fmt.Sprintf("#%d (domain '%s')", position+1, domain.Domain)
+}
+
+func firstNonEmptySessionValue(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+
+	return ""
 }
